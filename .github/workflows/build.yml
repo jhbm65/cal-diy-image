@@ -1,0 +1,114 @@
+# Builds Cal.diy (github.com/calcom/cal.diy, MIT) from source and publishes it to GHCR.
+# Upstream publishes no image, and the build needs more RAM than the Lodestar VPS has, so it runs here.
+# The steps follow upstream's .github/actions/docker-build-and-test (a database must be reachable at build time).
+# Run: Actions -> Build Cal.diy image -> Run workflow (or `gh workflow run build.yml -f ref=<sha>`).
+name: Build Cal.diy image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "calcom/cal.diy commit, tag or branch to build"
+        required: true
+        default: "54343aa685ae8f33159d2f485ec4a57bad5c574a"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  POSTGRES_USER: unicorn_user
+  POSTGRES_PASSWORD: magical_password
+  POSTGRES_DB: calendso
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out calcom/cal.diy
+        uses: actions/checkout@v4
+        with:
+          repository: calcom/cal.diy
+          ref: ${{ inputs.ref }}
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Image name and tag
+        id: meta
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cal.diy" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Start build-time database
+        run: |
+          docker network create stack
+          docker run -d --name database --network stack \
+            -e POSTGRES_USER -e POSTGRES_PASSWORD -e POSTGRES_DB postgres:17
+          for i in $(seq 1 30); do
+            docker exec database pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" && break
+            sleep 2
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=container:database
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./
+          file: ./Dockerfile
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Cal.diy built from calcom/cal.diy@${{ steps.meta.outputs.tag }}
+            org.opencontainers.image.licenses=MIT
+          build-args: |
+            NEXT_PUBLIC_WEBAPP_URL=http://localhost:3000
+            NEXT_PUBLIC_LICENSE_CONSENT=agree
+            CALCOM_TELEMETRY_DISABLED=1
+            DATABASE_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+            DATABASE_DIRECT_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+
+      - name: Test that the image boots
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+        run: |
+          db="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@database:5432/$POSTGRES_DB"
+          docker run -d --name caltest --network stack -p 3000:3000 \
+            -e DATABASE_HOST=database:5432 \
+            -e DATABASE_URL="$db" -e DATABASE_DIRECT_URL="$db" \
+            -e NEXTAUTH_SECRET=ci-only-not-a-real-secret-0000000000000000 \
+            -e CALENDSO_ENCRYPTION_KEY=ci-only-not-a-real-key-000000000 \
+            "$IMAGE"
+          for i in $(seq 1 90); do
+            code=$(curl -o /dev/null -s -w '%{http_code}' http://localhost:3000/auth/login || true)
+            echo "check $i: HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "307" ]; then echo "image boots"; exit 0; fi
+            sleep 5
+          done
+          docker logs --tail 200 caltest
+          exit 1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        run: |
+          docker push --all-tags "${{ steps.meta.outputs.image }}"
+          echo "Published ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
